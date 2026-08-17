@@ -18,7 +18,39 @@ from torch.testing._internal import (
     fake_config_module3 as config3,
 )
 from torch.testing._internal.common_utils import run_tests, TestCase
-from torch.utils._config_module import _ConfigEntry, _UNSET_SENTINEL, Config
+from torch.utils._config_module import (
+    _Config,
+    _ConfigEntry,
+    _UNSET_SENTINEL,
+    alias_fields_from,
+    Config,
+)
+
+
+# Module-level fixtures for alias_fields_from tests. Top-level so their
+# __qualname__ is a bare name (alias_fields_from rejects nested classes).
+class _alias_parent_mixed:
+    e_bool = True
+    e_config_int = Config(default=7)
+    e_annotated: str = "hi"
+    e_annotated_config: str | None = Config(default=None)
+
+    class not_a_field:
+        pass
+
+    def method_not_a_field(self):
+        return None
+
+
+@alias_fields_from(_alias_parent_mixed)
+class _alias_child_mixed:
+    pass
+
+
+@alias_fields_from(_alias_parent_mixed)
+class _alias_child_with_override:
+    # Override e_bool; all other parent fields should be aliased.
+    e_bool = False
 
 
 class TestConfigModule(TestCase):
@@ -519,6 +551,114 @@ torch.testing._internal.fake_config_module3.e_func = _warnings.warn""",
             self.assertTrue(config.e_aliased_bool)
         with config.patch(e_aliased_bool=True):
             self.assertTrue(config2.e_aliasing_bool)
+
+    def test_alias_to_subconfig_field(self):
+        # An alias whose target is a sub-config field resolves through to it,
+        # both as a top-level alias and via an alias_fields_from subconfig.
+        self.assertEqual(config.e_nested_alias_bool, config.nested.e_bool)
+        self.assertEqual(config.nested_alias.e_bool, config.nested.e_bool)
+        # value_type resolves through the alias so get_type is meaningful.
+        self.assertEqual(config.get_type("e_nested_alias_bool"), bool)
+        self.assertEqual(config.get_type("nested_alias.e_bool"), bool)
+        # Both are recorded as aliases in _config.
+        self.assertIsNotNone(config._config["e_nested_alias_bool"].alias)
+        self.assertIsNotNone(config._config["nested_alias.e_bool"].alias)
+
+    def test_alias_write_through_and_sibling(self):
+        self.assertTrue(config.nested.e_bool)
+        # Updating the target is reflected through every alias to it.
+        with config.patch({"nested.e_bool": False}):
+            self.assertFalse(config.e_nested_alias_bool)
+            self.assertFalse(config.nested_alias.e_bool)
+        # Writing through one alias mutates the shared target and is therefore
+        # observed through the sibling alias too.
+        with config.patch({"nested_alias.e_bool": False}):
+            self.assertFalse(config.nested.e_bool)
+            self.assertFalse(config.e_nested_alias_bool)
+
+    def test_alias_mock_patch_teardown(self):
+        # mock.patch does delattr+setattr on teardown; the aliased field must
+        # remain readable afterwards. Regression for `hide` never being cleared
+        # on the alias write path.
+        orig = config.nested.e_bool
+        with patch(
+            "torch.testing._internal.fake_config_module.e_nested_alias_bool",
+            not orig,
+        ):
+            self.assertEqual(config.e_nested_alias_bool, not orig)
+        self.assertEqual(config.e_nested_alias_bool, orig)
+        self.assertEqual(config.nested.e_bool, orig)
+
+    def test_alias_delattr_marks_target_dirty(self):
+        # delattr on an alias resets the target's user_override; the target
+        # module's hash/get_dict must reflect that reset rather than the stale
+        # pre-delete value. Regression for the target dirty-marking bypass.
+        with config.patch({"nested.e_bool": False}):
+            hash_before = config.get_hash()
+            saved_before = config.save_config()
+            delattr(config, "e_nested_alias_bool")
+            # Target is reset back to its default value, not left at False.
+            self.assertTrue(config.nested.e_bool)
+            self.assertNotEqual(config.get_hash(), hash_before)
+            self.assertNotEqual(config.save_config(), saved_before)
+
+    def test_alias_fields_from_skips_non_fields(self):
+        # alias_fields_from must only alias actual config fields. Nested
+        # classes and functions of the parent must not become config entries.
+        self.assertIsInstance(_alias_child_mixed.__dict__["e_bool"], _Config)
+        self.assertNotIn("not_a_field", _alias_child_mixed.__dict__)
+        self.assertNotIn("method_not_a_field", _alias_child_mixed.__dict__)
+
+    def test_alias_fields_from_unannotated_config_value_type(self):
+        # A parent field declared via Config(default=...) with no annotation
+        # must resolve to the default's type, not the _Config class. An
+        # annotated plain field resolves to its annotation. An annotated
+        # Config(default=...) field must resolve to the annotation, not
+        # type(default) (which would be NoneType for a str | None field).
+        self.assertEqual(_alias_child_mixed.__dict__["e_config_int"].value_type, int)
+        self.assertEqual(_alias_child_mixed.__dict__["e_annotated"].value_type, str)
+        self.assertEqual(
+            _alias_child_mixed.__dict__["e_annotated_config"].value_type, str | None
+        )
+
+    def test_alias_fields_from_child_override_not_aliased(self):
+        # A field that the child explicitly defines must not be replaced by an
+        # alias; the child's own definition takes precedence.
+        # e_bool is the child's plain bool, not a _Config alias wrapper.
+        self.assertNotIsInstance(_alias_child_with_override.__dict__["e_bool"], _Config)
+        self.assertFalse(_alias_child_with_override.__dict__["e_bool"])
+        # Other fields are still aliased.
+        self.assertIsInstance(
+            _alias_child_with_override.__dict__["e_config_int"], _Config
+        )
+        self.assertIsNotNone(_alias_child_with_override.__dict__["e_config_int"].alias)
+
+    def test_alias_unresolvable_raises(self):
+        # An alias whose module prefix does not exist raises AttributeError.
+        entry = _ConfigEntry(
+            Config(alias="nonexistent_top_module_xyz.some_field"),
+            name="bogus",
+        )
+        with self.assertRaisesRegex(AttributeError, "does not exist"):
+            config._get_alias_module_and_name(entry)
+
+    def test_alias_fields_from_qualname_assertion(self):
+        # A nested (non-top-level) parent class must be rejected at decoration
+        # time rather than producing an unresolvable alias.
+        class Outer:
+            class Inner:
+                e_bool = True
+
+        with self.assertRaisesRegex(AssertionError, "top-level config class"):
+            alias_fields_from(Outer.Inner)
+
+    def test_alias_excluded_from_save_and_hash(self):
+        # Aliased subconfig fields must not appear in save_config()/get_hash()
+        # as independent keys; only the real target field is serialized.
+        saved = config.save_config()
+        restored = pickle.loads(saved)
+        self.assertNotIn("nested_alias.e_bool", restored)
+        self.assertNotIn("e_nested_alias_bool", restored)
 
     def test_reference_is_default(self):
         t = config.e_dict
