@@ -1,5 +1,9 @@
 # Owner(s): ["module: dynamo"]
+import faulthandler
 import operator
+import queue
+import sys
+import threading
 import unittest
 import weakref
 from functools import cache
@@ -66,6 +70,106 @@ class RecompileUxTests(torch._dynamo.test_case.TestCase):
             opt_model(x, i)
 
         self.assertTrue(triggered)
+
+    def test_precompile_entry_runs_guard_complete_hook(self):
+        from torch._C._dynamo.eval_frame import (
+            _load_precompile_entry,
+            _reset_precompile_entries,
+            set_guard_complete_hook,
+        )
+
+        def fn(x):
+            return x + 1
+
+        def injected(x):
+            return x + 42
+
+        hook_results = []
+
+        def hook(guard_eval_result):
+            hook_results.append(guard_eval_result)
+            return guard_eval_result
+
+        compiled_fn = torch.compile(fn, backend="eager")
+        _load_precompile_entry(
+            fn.__code__,
+            torch._dynamo.guards.GuardManagerWrapper(),
+            injected.__code__,
+        )
+        prior_hook = set_guard_complete_hook(hook)
+        try:
+            args = (torch.randn(3, 2),)
+            self.assertEqual(compiled_fn(*args), injected(*args))
+            self.assertEqual(hook_results, [True])
+        finally:
+            set_guard_complete_hook(prior_hook)
+            _reset_precompile_entries(fn.__code__)
+
+    def test_reset_waits_for_inflight_precompile_guard(self):
+        from torch._C._dynamo.eval_frame import _load_precompile_entry, reset_code
+        from torch._dynamo.guards import GuardManagerWrapper, RootGuardManager
+
+        def fn(x):
+            return x + 1
+
+        def injected(x):
+            return x + 42
+
+        guard_entered = threading.Event()
+        release_guard = threading.Event()
+        reset_started = threading.Event()
+        errors = queue.SimpleQueue()
+        results = []
+
+        def blocking_guard(_locals):
+            guard_entered.set()
+            if not release_guard.wait(10):
+                raise AssertionError("timed out waiting to release guard")
+            return True
+
+        root = RootGuardManager()
+        root.add_lambda_guard(blocking_guard, [], None)
+        compiled_fn = torch.compile(fn, backend="eager")
+        _load_precompile_entry(
+            fn.__code__, GuardManagerWrapper(root), injected.__code__
+        )
+        args = (torch.randn(3, 2),)
+
+        def run_compiled():
+            try:
+                results.append(compiled_fn(*args))
+            except BaseException as error:
+                errors.put(error)
+
+        def run_reset():
+            try:
+                reset_started.set()
+                reset_code(fn.__code__)
+            except BaseException as error:
+                errors.put(error)
+
+        worker = threading.Thread(target=run_compiled, daemon=True)
+        resetter = threading.Thread(target=run_reset, daemon=True)
+        try:
+            worker.start()
+            self.assertTrue(guard_entered.wait(10))
+            resetter.start()
+            self.assertTrue(reset_started.wait(10))
+            resetter.join(1)
+            self.assertTrue(resetter.is_alive())
+        finally:
+            release_guard.set()
+            worker.join(10)
+            resetter.join(10)
+            reset_code(fn.__code__)
+
+        self.assertFalse(worker.is_alive())
+        self.assertFalse(resetter.is_alive())
+        raised = []
+        while not errors.empty():
+            raised.append(errors.get_nowait())
+        self.assertEqual(raised, [])
+        self.assertEqual(results, [injected(*args)])
 
     def test_loop_torture(self):
         def loop_torture(input, iters):
@@ -497,6 +601,57 @@ class IsolateRecompilesTests(torch._dynamo.test_case.TestCase):
         return len(torch._dynamo.eval_frame._debug_get_cache_entry_list(code))
 
     # ===== Basic isolation: independent caches per compile call =====
+
+    def test_concurrent_calls_do_not_deadlock_on_the_cache_lock(self):
+        """lookup() holds the ExtraState cache lock across guard evaluation,
+        and guard evaluation runs Python -- a LAMBDA_GUARD calls straight back
+        into the interpreter, so the GIL can drop mid-iteration. A thread that
+        blocks on that lock while HOLDING the GIL wedges the owner, who needs
+        the GIL to finish. The lock therefore has to release the GIL before it
+        waits. A short switch interval makes the handoff frequent.
+
+        The wedged thread holds the GIL, so nothing written in Python can
+        report this -- join() never returns, and a watchdog thread cannot help
+        either, since Event.wait must reacquire the GIL to run its next
+        bytecode. faulthandler's timeout runs on a C thread and needs no GIL,
+        so it is the only thing here that still fires. file= is required
+        because pytest's --capture=sys leaves sys.stderr without a fileno.
+        """
+
+        def f(x):
+            return x.sin() + x.cos()
+
+        opt = torch.compile(f, backend="eager", dynamic=False)
+        args = [torch.randn(n) for n in (3, 4, 5)]
+        for arg in args:
+            opt(arg)
+
+        errors = queue.SimpleQueue()
+
+        def hammer():
+            try:
+                for _ in range(200):
+                    for arg in args:
+                        opt(arg)
+            except BaseException as e:
+                errors.put(e)
+
+        threads = [threading.Thread(target=hammer, daemon=True) for _ in range(4)]
+        prior_interval = sys.getswitchinterval()
+        sys.setswitchinterval(1e-6)
+        faulthandler.dump_traceback_later(300, exit=True, file=sys.__stderr__)
+        try:
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+        finally:
+            faulthandler.cancel_dump_traceback_later()
+            sys.setswitchinterval(prior_interval)
+        raised = []
+        while not errors.empty():
+            raised.append(errors.get_nowait())
+        self.assertEqual(raised, [])
 
     @torch._dynamo.config.patch(
         recompile_limit=1,
