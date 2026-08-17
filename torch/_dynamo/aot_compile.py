@@ -57,8 +57,18 @@ class CompileArtifacts:
     system_info: SystemInfo = dataclasses.field(default_factory=SystemInfo.current)
 
     def check_compatibility(self) -> None:
-        current_system = SystemInfo.current()
-        current_system.check_compatibility(self.system_info, self.device_type)
+        # The CACHED info is the receiver, matching _DynamoCacheEntry: the skip
+        # for an artifact predating cpu_codegen_target keys off self, and every
+        # mismatch message labels self "cached" and the argument "current".
+        # Determining the codegen target runs the C++ toolchain, so only pay for
+        # it when this artifact actually records one to compare against.
+        current = SystemInfo.current(
+            cpu_codegen=(
+                self.device_type == "cpu"
+                and self.system_info.cpu_codegen_target is not None
+            )
+        )
+        self.system_info.check_compatibility(current, self.device_type)
 
 
 class AOTCompilePickler(pickle.Pickler):

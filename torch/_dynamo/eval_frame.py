@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import atexit
 import contextlib
+import dataclasses
 import functools
 import inspect
 import itertools
@@ -114,6 +115,7 @@ from .backends.registry import CompilerFn, lookup_backend
 from .code_context import code_context
 from .exc import (
     CondOpArgsMismatchError,
+    RecompileError,
     ShortenTraceback,
     UncapturedHigherOrderOpError,
     Unsupported,
@@ -151,6 +153,32 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 _next_isolate_recompiles_id = itertools.count()
+_explicit_compile_regions: dict[int, weakref.ReferenceType[object]] = {}
+_explicit_compile_regions_lock = threading.Lock()
+
+
+def _register_explicit_compile_region(region_id: int, owner: object) -> None:
+    with _explicit_compile_regions_lock:
+        _explicit_compile_regions[region_id] = weakref.ref(owner)
+
+
+def _unregister_explicit_compile_region(region_id: int) -> None:
+    with _explicit_compile_regions_lock:
+        _explicit_compile_regions.pop(region_id, None)
+
+
+def _get_explicit_compile_regions() -> tuple[int, ...]:
+    with _explicit_compile_regions_lock:
+        live = []
+        dead = []
+        for region_id, owner in _explicit_compile_regions.items():
+            if owner() is None:
+                dead.append(region_id)
+            else:
+                live.append(region_id)
+        for region_id in dead:
+            del _explicit_compile_regions[region_id]
+        return tuple(live)
 
 
 always_optimize_code_objects = utils.ExactWeakKeyDictionary()
@@ -206,13 +234,33 @@ class DynamoStance:
 
 
 _stance = DynamoStance()
-_force_eager_nested_compile = threading.local()
+
+
+# Thread-local: serving() scopes the calls made in ITS block. A process-global
+# counter made one request handler's serving() block reject a concurrent
+# handler's legitimate recompile, and a serving process is multi-threaded by
+# definition.
+class DepthTLS(threading.local):
+    # The default lives on the TYPE. Read through getattr(obj, name, default),
+    # a bare threading.local() builds and clears an AttributeError on every
+    # miss, and the miss is the steady state: only a thread inside the scope
+    # ever writes the attribute, so the threads that pay are exactly the ones
+    # that never use the feature. Both counters are read on the per-call path.
+    depth = 0
+
+
+_fail_on_recompile_override = DepthTLS()
+_force_eager_nested_compile = DepthTLS()
+
+
+def _fail_on_recompile_depth() -> int:
+    return _fail_on_recompile_override.depth
 
 
 @contextlib.contextmanager
 def _use_eager_on_nested_compile() -> Generator[None, None, None]:
     """Run torch.compile wrappers eagerly inside compiler-internal tracing."""
-    prior = getattr(_force_eager_nested_compile, "depth", 0)
+    prior = _force_eager_nested_compile.depth
     _force_eager_nested_compile.depth = prior + 1
     try:
         yield
@@ -221,7 +269,7 @@ def _use_eager_on_nested_compile() -> Generator[None, None, None]:
 
 
 def _is_eager_on_nested_compile() -> bool:
-    return getattr(_force_eager_nested_compile, "depth", 0) > 0
+    return _force_eager_nested_compile.depth > 0
 
 
 def _set_stance(stance: DynamoStance) -> DynamoStance:
@@ -240,6 +288,42 @@ def _set_stance(stance: DynamoStance) -> DynamoStance:
 
 
 _set_stance._dynamo_forbidden = True  # type: ignore[attr-defined]
+
+
+def _get_effective_stance() -> DynamoStance:
+    """The stance in force, with serving()'s override applied.
+
+    The override replaces only the ACTION, keeping the ambient stance's other
+    fields. Building a bare DynamoStance("fail_on_recompile") silently dropped
+    skip_guard_eval_unsafe and backend along with it.
+
+    It does take precedence over force_eager, which reads backwards but is the
+    intended contract: serving() is the narrower, explicitly scoped request, and
+    it still honours what force_eager guarantees -- it raises rather than
+    compiling. Running eager instead would silently stop serving the artifact,
+    which is the failure serving() exists to make loud.
+    """
+    if _fail_on_recompile_depth():
+        # skip_guard_eval_unsafe is dropped deliberately: kept, an uncovered
+        # call raises a bare RuntimeError from the skip-guard path instead of
+        # the RecompileError serving() documents, so `except RecompileError`
+        # around a served call would stop catching it.
+        return dataclasses.replace(
+            _stance, stance="fail_on_recompile", skip_guard_eval_unsafe=False
+        )
+    return _stance
+
+
+def _enter_fail_on_recompile_override() -> None:
+    _fail_on_recompile_override.depth = _fail_on_recompile_depth() + 1
+
+
+def _exit_fail_on_recompile_override() -> None:
+    depth = _fail_on_recompile_depth()
+    if depth <= 0:
+        raise AssertionError("fail_on_recompile override is not active")
+    _fail_on_recompile_override.depth = depth - 1
+
 
 _EXAMPLE_INPUTS: dict[str, list[Any]] | None = None
 
@@ -277,27 +361,28 @@ def _is_in_optimized_module() -> bool:
 
 
 def _callback_from_stance(callback: DynamoCallback) -> DynamoCallback:
-    if _stance.stance == "default":
+    stance = _get_effective_stance()
+    if stance.stance == "default":
         # force_backend
-        if _stance.backend is not None and callback not in (False, None):
-            callback = _create_wrapped_callback(get_compiler_fn(_stance.backend))
+        if stance.backend is not None and callback not in (False, None):
+            callback = _create_wrapped_callback(get_compiler_fn(stance.backend))
 
         return callback
-    elif _stance.stance == "eager_then_compile":
+    elif stance.stance == "eager_then_compile":
         if callback not in (False, None):
-            return _create_delayed_compile_callback(callback, _stance.stance)
+            return _create_delayed_compile_callback(callback, stance.stance)
         return callback
-    elif _stance.stance == "aot_eager_then_compile":
+    elif stance.stance == "aot_eager_then_compile":
         if callback not in (False, None):
-            return _create_delayed_compile_callback(callback, _stance.stance)
+            return _create_delayed_compile_callback(callback, stance.stance)
         return callback
-    elif _stance.stance == "force_eager":
+    elif stance.stance == "force_eager":
         # disable
         return None
-    elif _stance.stance == "eager_on_recompile":
+    elif stance.stance == "eager_on_recompile":
         # run mode
         return False
-    elif _stance.stance == "fail_on_recompile":
+    elif stance.stance == "fail_on_recompile":
         if callback in (False, None):
             return callback
 
@@ -308,6 +393,24 @@ def _callback_from_stance(callback: DynamoCallback) -> DynamoCallback:
                 return ConvertFrameReturn()
             if not convert_frame.has_tensor_in_frame(frame):
                 return ConvertFrameReturn()
+
+            from . import decorators
+
+            prev_frame = sys._getframe()
+            # pyrefly: ignore [bad-assignment]
+            while (
+                prev_frame
+                and "torch/_dynamo/eval_frame.py" in prev_frame.f_code.co_filename
+            ):
+                prev_frame = prev_frame.f_back  # type: ignore[assignment]
+            if (
+                prev_frame
+                and prev_frame.f_code is decorators._nonrecursive_disable_wrapper_code
+            ):
+                return ConvertFrameReturn(
+                    apply_to_code=False,
+                    skip_reason="tracing is non-recursively disabled for this frame",
+                )
 
             from torch._C._dynamo.eval_frame import (
                 _debug_get_cache_entry_list,
@@ -340,14 +443,22 @@ def _callback_from_stance(callback: DynamoCallback) -> DynamoCallback:
                 message += "\nFailed on the following precompiled guards: "
                 for entry in precompile_entries:
                     message += f"\n{entry.guard_manager}{entry.guard_manager.check_verbose(frame.f_locals)}"  # type: ignore[attr-defined]
-            raise RuntimeError(message)
+            raise RecompileError(message)
 
         # to prevent cache miss due to different backend
         fail_callback._torchdynamo_orig_backend = callback  # type: ignore[attr-defined]
+        if _fail_on_recompile_depth():
+            # Only for serving(): this marker makes the C++ frame eval ignore a
+            # RUN_ONLY pin, so an uncovered call raises instead of quietly
+            # running eager. Setting it for a plain
+            # set_stance("fail_on_recompile") would change that public stance
+            # for everyone -- a frame past its recompile limit would start
+            # raising where it used to run eager, and so would every callee.
+            fail_callback._torchdynamo_force_callback_on_cache_miss = True  # type: ignore[attr-defined]
 
         return fail_callback
     else:
-        raise RuntimeError(f"invalid torch.compile stance '{_stance}'")
+        raise RuntimeError(f"invalid torch.compile stance '{stance}'")
 
 
 def _create_wrapped_callback(
@@ -403,7 +514,7 @@ def _create_delayed_compile_callback(
 
 
 def _is_skip_guard_eval_unsafe_stance() -> bool:
-    return _stance.skip_guard_eval_unsafe
+    return _get_effective_stance().skip_guard_eval_unsafe
 
 
 def _reset_guarded_backend_cache() -> None:
@@ -453,6 +564,17 @@ def _get_cache_entries_for_region(
     if callable(code):
         code = code.__code__
     return torch._C._dynamo.eval_frame._get_cache_entries_for_region(
+        code, isolate_recompiles_id
+    )
+
+
+def _clear_cache_entries_for_region(
+    code: types.CodeType | Callable[..., Any],
+    isolate_recompiles_id: int,
+) -> None:
+    if callable(code):
+        code = code.__code__
+    torch._C._dynamo.eval_frame._clear_cache_entries_for_region(
         code, isolate_recompiles_id
     )
 
@@ -998,11 +1120,21 @@ class _TorchDynamoContext:
                         self._package.initialize(
                             fn_key, result.dynamo, ignore_inlined_sources=False
                         )
-                        self._package.install(result.backends)
+                        # Install into the SAME region this context looks up in.
+                        # Precompile entries match their own region only, so a
+                        # default-bucket install here would never be found by an
+                        # isolate_recompiles=True context -- the cache would load
+                        # and then silently serve nothing.
+                        self._package.install(
+                            result.backends,
+                            isolate_recompiles_id=self._isolate_recompiles_id,
+                        )
                     except RuntimeError:
                         log.warning(
                             "Failed to load entry from dynamo cache", exc_info=True
                         )
+                        if self._package.is_initialized():
+                            self._package.reset_after_failed_install()
                         self._package.initialize(
                             fn_key, None, ignore_inlined_sources=False
                         )
@@ -1281,7 +1413,10 @@ class _TorchDynamoContext:
                         set_eval_frame(None)
                         if fullgraph_count_enabled and call_succeeded:
                             count = set_fullgraph_compiled_frame_count(-1)
-                            if count == 0 and _stance.stance == "default":
+                            if (
+                                count == 0
+                                and _get_effective_stance().stance == "default"
+                            ):
                                 skip_reasons = get_skip_reasons()
                                 msg = "torch.compile with fullgraph=True found no compiled frames."
                                 if skip_reasons:
@@ -1872,6 +2007,9 @@ def _optimize(
             dynamic_shapes=dynamic_shapes,
         )
 
+    # get_compiler_fn erases the name, and torch.compile hands us a
+    # _TorchCompileWrapper rather than the string the user wrote.
+    emits_native_code = getattr(backend, "compiler_name", backend) != "eager"
     backend = get_compiler_fn(backend)
 
     # Find if backend has any extra context manager
@@ -1886,7 +2024,12 @@ def _optimize(
     if config.caching_precompile and package is None:
         from .package import CompilePackage
 
-        package = CompilePackage(fn=None, dynamo=None, ignore_inlined_sources=False)
+        package = CompilePackage(
+            fn=None,
+            dynamo=None,
+            ignore_inlined_sources=False,
+            requires_native_backend_compatibility=emits_native_code,
+        )
 
     return _optimize_catch_errors(
         convert_frame.convert_frame(
@@ -2816,6 +2959,7 @@ def _optimize_assert(
     Used for fullgraph=True and export, since we must always error on graph breaks and ignore
     symbolic_convert.error_on_graph_break. Can also be used for testing.
     """
+    emits_native_code = getattr(backend, "compiler_name", backend) != "eager"
     backend = get_compiler_fn(backend)
 
     # Find if backend has any extra context manager
@@ -2829,7 +2973,12 @@ def _optimize_assert(
         # and OptimizeContext.
         from .package import CompilePackage
 
-        package = CompilePackage(fn=None, dynamo=None, ignore_inlined_sources=False)
+        package = CompilePackage(
+            fn=None,
+            dynamo=None,
+            ignore_inlined_sources=False,
+            requires_native_backend_compatibility=emits_native_code,
+        )
 
     return _optimize_catch_errors(
         convert_frame.convert_frame_assert(
